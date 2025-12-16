@@ -1,45 +1,26 @@
 import numpy as np
 from sklearn.linear_model import Ridge
 
-from .PRODA import PRODA
-from .CertifiedRegression import CertifiedRegression
-
-
-def trim_regression(X, y, keep_count, alpha=1.0, tol=1e-5, max_iter=400, seed=123):
-    X = np.asarray(X, dtype=float)
-    y = np.asarray(y, dtype=float).ravel()
+def trim_regression(X, y, keep_count, alpha, seed=123, max_iters=400, tol=1e-5):
+    X = np.asarray(X, float)
+    y = np.asarray(y, float).reshape(-1)
+    n = X.shape[0]
+    if keep_count <= 0 or keep_count > n:
+        raise ValueError("invalid keep_count")
 
     rng = np.random.RandomState(seed)
-    inds = rng.permutation(X.shape[0])[:keep_count]
+    idx = np.sort(rng.choice(n, keep_count, replace=False))
+    last_err = np.inf
 
-    model = Ridge(alpha=alpha)
-    model.fit(X[inds], y[inds])
+    for _ in range(max_iters):
+        model = Ridge(alpha=alpha, fit_intercept=True, max_iter=10000)
+        model.fit(X[idx], y[idx])
+        sq = (model.predict(X) - y) ** 2
+        new_idx = np.sort(np.argsort(sq)[:keep_count])
+        err = float(np.sum(np.sort(sq)[:keep_count]))
+        if np.array_equal(new_idx, idx) and (last_err - err) <= tol:
+            return model
+        idx, last_err = new_idx, err
 
-    prev_loss = float("inf")
-    for _ in range(max_iter):
-        resid = (model.predict(X) - y) ** 2
-        inds = np.argsort(resid)[:keep_count]
-        model.fit(X[inds], y[inds])
-
-        loss = float(np.mean((model.predict(X[inds]) - y[inds]) ** 2))
-        if abs(prev_loss - loss) <= tol:
-            break
-        prev_loss = loss
-
+    model.fit(X[idx], y[idx])
     return model
-
-
-def proda_defense(X, y, seed=123):
-    X = np.asarray(X, dtype=float)
-    y = np.asarray(y, dtype=float).ravel()
-    base = Ridge(alpha=1.0)
-    proda = PRODA(X, y)
-    return proda.apply_defense(alpha=0.2, gamma=20, eps=200, base_regressor=base, random_state=seed)
-
-
-def certified_regression_defense(X, y):
-    X = np.asarray(X, dtype=float)
-    y = np.asarray(y, dtype=float).ravel()
-    cr = CertifiedRegression(T=21, s=12, alpha=10.0)
-    cr.fit(X, y)
-    return cr

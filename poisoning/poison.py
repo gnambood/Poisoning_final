@@ -1,253 +1,242 @@
-# poisoning/poison.py
-import os, json
-import numpy as np
-from sklearn.linear_model import RidgeCV, Ridge
+import sys
+sys.dont_write_bytecode = True
 
-from poisoning.gd_poisoners import RidgeGDPoisoner, AttackParams
+import os
+import numpy as np
+
+from sklearn.linear_model import Ridge, RidgeCV
+from sklearn.metrics import mean_squared_error
+
+from .gd_poisoners import AttackParams, RidgeGDPoisoner
 from defense.TRIM import trim_regression
 from defense.PRODA import PRODA
 from defense.CertifiedRegression import CertifiedRegression
 
-DATASET_DIR = "./datasets"
 SEED = 123
-
-# Paper Table VI
-ETA_GRID = [0.01, 0.03, 0.05, 0.1, 0.3, 0.5, 1.0]
-BETA = 0.75
-EPS1 = 1e-5
-
-# Poison rates you are using
-POISON_RATES = [0.12, 0.16, 0.20]
-
-# Paper: use 1400 points per dataset for experiments
-SUBSAMPLE_N = 1400
-
-OUT_JSON = "optp_hyperparams.json"
+POISON_RATES = [0.00, 0.04, 0.08, 0.12, 0.16, 0.20]
+DATASET_DIR = os.path.join(os.path.dirname(__file__), "..", "datasets")
 
 
-def mse(y_true, y_pred):
-    y_true = np.asarray(y_true).reshape(-1)
-    y_pred = np.asarray(y_pred).reshape(-1)
-    return float(np.mean((y_pred - y_true) ** 2))
-
-
-def read_dataset(csv_path):
+def read_dataset(path):
     X, y = [], []
-    with open(csv_path, "r") as f:
-        _ = f.readline()  # header
+    with open(path, "r") as f:
+        next(f)
         for line in f:
-            vals = [float(v) for v in line.strip().split(",")]
-            y.append(vals[0])
-            X.append(vals[1:])
-    return np.asarray(X, dtype=float), np.asarray(y, dtype=float).reshape(-1)
+            row = list(map(float, line.strip().split(",")))
+            y.append(row[0])
+            X.append(row[1:])
+    return np.asarray(X), np.asarray(y)
 
 
 def normalize_01(X, y):
-    Xmin, Xmax = X.min(axis=0), X.max(axis=0)
-    X = (X - Xmin) / (Xmax - Xmin + 1e-12)
-    ymin, ymax = y.min(), y.max()
-    y = (y - ymin) / (ymax - ymin + 1e-12)
+    X = (X - X.min(axis=0)) / (X.max(axis=0) - X.min(axis=0) + 1e-12)
+    y = (y - y.min()) / (y.max() - y.min() + 1e-12)
     return X, y
 
 
-def subsample(X, y, n, seed):
-    rng = np.random.RandomState(seed)
-    if X.shape[0] <= n:
-        return X, y
-    idx = rng.choice(X.shape[0], size=n, replace=False)
-    return X[idx], y[idx]
-
-
-def split_1_3(X, y, seed):
-    n = X.shape[0]
-    rng = np.random.RandomState(seed)
-    perm = rng.permutation(n)
-    n_tr = n // 3
-    n_te = n // 3
-    tr = perm[:n_tr]
-    te = perm[n_tr:n_tr + n_te]
-    va = perm[n_tr + n_te:]
+def split_data(X, y, n_train, n_val, n_test):
+    rng = np.random.RandomState(SEED)
+    perm = rng.permutation(len(X))
+    tr = perm[:n_train]
+    va = perm[n_train:n_train + n_val]
+    te = perm[n_train + n_val:n_train + n_val + n_test]
     return X[tr], y[tr], X[va], y[va], X[te], y[te]
 
 
-def fit_ridge_cv(Xtr, ytr):
-    alphas = np.logspace(-4, 3, 20)
-    cv = RidgeCV(alphas=alphas, fit_intercept=True)
-    cv.fit(Xtr, ytr)
-    lam = float(cv.alpha_)
-    model = Ridge(alpha=lam, fit_intercept=True, max_iter=10000)
-    model.fit(Xtr, ytr)
-    return model, lam
+def fit_ridge_cv(X, y):
+    grid = np.logspace(-4, 3, 20)
+    cv = RidgeCV(alphas=grid).fit(X, y)
+    model = Ridge(alpha=float(cv.alpha_), max_iter=10000)
+    model.fit(X, y)
+    return model, float(cv.alpha_)
 
 
-def proda_defense(X, y, seed):
-    base = Ridge(alpha=1.0)
-    p = PRODA(X, y)
-    return p.apply_defense(alpha=0.2, gamma=20, eps=200, base_regressor=base, random_state=seed)
+def mse(y_true, y_pred):
+    return mean_squared_error(y_true, y_pred)
 
 
-def certified_regression_defense(X, y):
-    cr = CertifiedRegression(T=21, s=12, alpha=10.0)
-    cr.fit(X, y)
-    return cr
+def print_optp_table(dataset, clean_test, rows, objective):
+    print("=" * 78)
+    print(f"OptP sweep | dataset={dataset} | objective={objective}")
+    print("=" * 78)
+    print(" alpha     p   clean_test    optp_test   xClean   eta*")
+    print("-" * 78)
+    for r in rows:
+        eta_str = f"{r['eta']:.3f}" if r['eta'] is not None else "-"
+        print(f" {r['alpha']:>4.2f} {r['p']:>5d}   {clean_test:>10.6f}   {r['optp_test']:>10.6f}   {r['xclean']:>6.2f}   {eta_str:>5}")
+    print("-" * 78)
 
 
-def paper_config_for_dataset(name):
-    """
-    Paper Table I (Ridge):
-    - Health: BFlip (x,y), Wtr
-    - Loan:   BFlip x-only, Wval
-    - House:  BFlip (x,y), Wtr
+def print_defense_table(dataset, alpha_star, clean_val, clean_test, res, objective, optimize_y):
+    print("=" * 78)
+    print(f"Defenses on max-poison | dataset={dataset} | alpha*={alpha_star:.2f}")
+    print("=" * 78)
+    print("Method               Val MSE    Test MSE   Test xClean")
+    print("-" * 78)
 
-    We map:
-    - pharm-preproc.csv -> Health-like
-    """
-    n = name.lower()
-    if "loan" in n:
-        return {"objective": "Wval", "optimize_y": False}
-    if "pharm" in n:
-        return {"objective": "Wtr", "optimize_y": True}
-    if "house" in n:
-        return {"objective": "Wtr", "optimize_y": True}
-    # default: Wtr, optimize both
-    return {"objective": "Wtr", "optimize_y": True}
+    for name, (v, t) in res.items():
+        xc = t / clean_test
+        print(f"{name:<20} {v:>10.6f} {t:>10.6f} {xc:>12.2f}")
+
+    print("-" * 78)
+    print(f"OptP knobs: objective={objective}, optimize_y={optimize_y}")
 
 
-def run_one_dataset(csv_path, hyperlog):
-    fname = os.path.basename(csv_path)
-
-    X, y = read_dataset(csv_path)
-    X, y = normalize_01(X, y)
-    X, y = subsample(X, y, SUBSAMPLE_N, SEED)
-
-    Xtr, ytr, Xval, yval, Xte, yte = split_1_3(X, y, SEED)
-
-    clean_model, lam = fit_ridge_cv(Xtr, ytr)
-    clean_val = mse(yval, clean_model.predict(Xval))
-    clean_te = mse(yte, clean_model.predict(Xte))
-
-    cfg = paper_config_for_dataset(fname)
-
-    print("\n============================================================")
-    print(f"Dataset: {fname}")
-    print(f"Ridge λ (CV): {lam:.6g}")
-    print(f"OptP config (paper Table I): objective={cfg['objective']} optimize_y={cfg['optimize_y']}")
-    print("============================================================")
-
-    for alpha in POISON_RATES:
-        p = int(round(alpha * Xtr.shape[0]))
-        if p <= 0:
-            continue
-
-        best = None
-
-        # Sweep eta (paper Table VI)
-        for eta in ETA_GRID:
-            params = AttackParams(
-                eta=eta,
-                beta=BETA,
-                eps=EPS1,
-                objective=cfg["objective"],
-                optimize_y=cfg["optimize_y"],
-                seed=SEED,
-                max_outer_iters=50,
-                min_outer_iters=15,
-                max_linesearch_iters=25
-            )
-
-            poisoner = RidgeGDPoisoner(Xtr, ytr, Xval, yval, Xte, yte, lam=lam, params=params)
-            Xp, yp, poisoned_model = poisoner.poison_optp(num_poison=p)
-
-            pois_val = mse(yval, poisoned_model.predict(Xval))
-            pois_te = mse(yte, poisoned_model.predict(Xte))
-
-            # choose by outer objective (maximize Wtr or Wval)
-            score = pois_val if cfg["objective"] == "Wval" else mse(ytr, poisoned_model.predict(Xtr))
-            if best is None or score > best["score"]:
-                best = {
-                    "eta": eta,
-                    "alpha": alpha,
-                    "p": p,
-                    "lam": lam,
-                    "objective": cfg["objective"],
-                    "optimize_y": cfg["optimize_y"],
-                    "val_mse": pois_val,
-                    "test_mse": pois_te,
-                    "Xp": Xp,
-                    "yp": yp,
-                    "poisoned_model": poisoned_model,
-                    "score": score
-                }
-
-        # Build poisoned training set using best poisons
-        Xp, yp = best["Xp"], best["yp"]
-        Xtr_p = np.vstack([Xtr, Xp])
-        ytr_p = np.concatenate([ytr, yp])
-
-        # Defenses
-        trim_model = trim_regression(Xtr_p, ytr_p, keep_count=Xtr.shape[0], alpha=lam, seed=SEED)
-        trim_val = mse(yval, trim_model.predict(Xval))
-        trim_te = mse(yte, trim_model.predict(Xte))
-
-        proda_model = proda_defense(Xtr_p, ytr_p, seed=SEED)
-        proda_val = mse(yval, proda_model.predict(Xval))
-        proda_te = mse(yte, proda_model.predict(Xte))
-
-        cert_model = certified_regression_defense(Xtr_p, ytr_p)
-        cert_val = mse(yval, cert_model.predict(Xval))
-        cert_te = mse(yte, cert_model.predict(Xte))
-
-        # Print in your requested format
-        print(f"\n--- poison rate α = {alpha:.2f} (p = {p}) ---")
-        print(f"unpoisoned - validation mse: {clean_val:.6f}, test mse: {clean_te:.6f}")
-        print(f"poisoned   - validation mse: {best['val_mse']:.6f}, test mse: {best['test_mse']:.6f}")
-        print(f"(best eta = {best['eta']})")
-
-        print("\nrunnning trim defense")
-        print(f"validation mse: {trim_val:.6f}, test mse: {trim_te:.6f}")
-
-        print("\nrunnning PRODA defense")
-        print(f"validation mse: {proda_val:.6f}, test mse: {proda_te:.6f}")
-
-        print("\nrunnning certified regression defense")
-        print(f"validation mse: {cert_val:.6f}, test mse: {cert_te:.6f}")
-
-        # Record hyperparameters
-        hyperlog.append({
-            "dataset": fname,
-            "alpha": alpha,
-            "p": p,
-            "ridge_lambda_cv": lam,
-            "objective": cfg["objective"],
-            "optimize_y": cfg["optimize_y"],
-            "beta": BETA,
-            "eps1": EPS1,
-            "eta_best": best["eta"],
-            "poisoned_val_mse": best["val_mse"],
-            "poisoned_test_mse": best["test_mse"],
-            "trim_val_mse": trim_val,
-            "trim_test_mse": trim_te,
-            "proda_val_mse": proda_val,
-            "proda_test_mse": proda_te,
-            "cert_val_mse": cert_val,
-            "cert_test_mse": cert_te
-        })
+MAKE_PLOTS = True
 
 
 def main():
-    files = [f for f in os.listdir(DATASET_DIR) if f.endswith(".csv")]
-    # run smaller first
-    files.sort(key=lambda f: os.path.getsize(os.path.join(DATASET_DIR, f)))
+    datasets = [
+        ("house-processed.csv", "Wtr", True),
+        ("loan-processed.csv", "Wval", False),
+        ("pharm-preproc.csv", "Wtr", True),
+    ]
 
-    hyperlog = []
+    n_train, n_val, n_test = 300, 300, 300
 
-    for f in files:
-        run_one_dataset(os.path.join(DATASET_DIR, f), hyperlog)
+    for fname, objective, optimize_y in datasets:
+        X, y = read_dataset(os.path.join(DATASET_DIR, fname))
+        X, y = normalize_01(X, y)
 
-    with open(OUT_JSON, "w") as fp:
-        json.dump(hyperlog, fp, indent=2)
+        Xtr, ytr, Xva, yva, Xte, yte = split_data(X, y, n_train, n_val, n_test)
 
-    print(f"\nSaved hyperparameter log to: {OUT_JSON}")
+        clean_model, lam = fit_ridge_cv(Xtr, ytr)
+        clean_val = mse(yva, clean_model.predict(Xva))
+        clean_test = mse(yte, clean_model.predict(Xte))
+
+        params = AttackParams(
+            eta=0.1,
+            objective=objective,
+            optimize_y=optimize_y,
+            seed=SEED
+        )
+
+        poisoner = RidgeGDPoisoner(Xtr, ytr, Xva, yva, Xte, yte, lam, params)
+
+        sweep_rows = []
+        best_alpha = None
+        best_p = None
+        best_poison = None
+        best_score = -np.inf
+
+        for alpha in POISON_RATES:
+            p = int(round(alpha * len(Xtr)))
+            if p == 0:
+                optp_test = clean_test
+                sweep_rows.append({
+                    "alpha": alpha,
+                    "p": 0,
+                    "optp_test": optp_test,
+                    "xclean": 1.0,
+                    "eta": None
+                })
+                continue
+
+            Xp, yp, poisoned_model = poisoner.poison_optp(p)
+            optp_test = mse(yte, poisoned_model.predict(Xte))
+            score = mse(ytr, poisoned_model.predict(Xtr))
+
+            sweep_rows.append({
+                "alpha": alpha,
+                "p": p,
+                "optp_test": optp_test,
+                "xclean": optp_test / clean_test,
+                "eta": params.eta
+            })
+
+            if score > best_score:
+                best_score = score
+                best_alpha = alpha
+                best_p = p
+                best_poison = (Xp, yp)
+
+        print_optp_table(fname, clean_test, sweep_rows, objective)
+
+        Xp, yp = best_poison
+        Xtr_p = np.vstack([Xtr, Xp])
+        ytr_p = np.concatenate([ytr, yp])
+
+        results = {}
+
+        results["Clean"] = (clean_val, clean_test)
+
+        optp_model = poisoner.fit_ridge(Xtr_p, ytr_p)
+        results["OptP"] = (
+            mse(yva, optp_model.predict(Xva)),
+            mse(yte, optp_model.predict(Xte))
+        )
+
+        trim_model = trim_regression(Xtr_p, ytr_p, len(Xtr), lam, seed=SEED)
+        results["TRIM"] = (
+            mse(yva, trim_model.predict(Xva)),
+            mse(yte, trim_model.predict(Xte))
+        )
+
+        proda_model = PRODA(Xtr_p, ytr_p).apply_defense(
+            alpha=best_alpha,
+            gamma=20,
+            eps=200,
+            base_regressor=Ridge(alpha=lam),
+            random_state=SEED
+        )
+        results["PRODA"] = (
+            mse(yva, proda_model.predict(Xva)),
+            mse(yte, proda_model.predict(Xte))
+        )
+
+        cert = CertifiedRegression(alpha=lam)
+        cert.fit(Xtr_p, ytr_p)
+        results["Certified"] = (
+            mse(yva, cert.predict(Xva)),
+            mse(yte, cert.predict(Xte))
+        )
+
+        print_defense_table(fname, best_alpha, clean_val, clean_test, results, objective, optimize_y)
+
+        if MAKE_PLOTS:
+            import matplotlib.pyplot as plt
+
+            alphas = [r['alpha'] for r in sweep_rows if r['p'] > 0]
+            optp_curve = [r['optp_test'] for r in sweep_rows if r['p'] > 0]
+
+            trim_curve = []
+            proda_curve = []
+            cert_curve = []
+
+            for a in alphas:
+                p = int(round(a * len(Xtr)))
+                Xp, yp, _ = poisoner.poison_optp(p)
+                Xtr_p = np.vstack([Xtr, Xp])
+                ytr_p = np.concatenate([ytr, yp])
+
+                trim_m = trim_regression(Xtr_p, ytr_p, len(Xtr), lam, seed=SEED)
+                trim_curve.append(mse(yte, trim_m.predict(Xte)))
+
+                proda_m = PRODA(Xtr_p, ytr_p).apply_defense(
+                    alpha=a,
+                    gamma=20,
+                    eps=200,
+                    base_regressor=Ridge(alpha=lam),
+                    random_state=SEED
+                )
+                proda_curve.append(mse(yte, proda_m.predict(Xte)))
+
+                cert_m = CertifiedRegression(alpha=lam)
+                cert_m.fit(Xtr_p, ytr_p)
+                cert_curve.append(mse(yte, cert_m.predict(Xte)))
+
+            plt.figure(figsize=(6, 4))
+            plt.plot(alphas, optp_curve, marker='o', label='OptP')
+            plt.plot(alphas, trim_curve, marker='s', label='TRIM')
+            plt.plot(alphas, proda_curve, marker='^', label='PRODA')
+            plt.plot(alphas, cert_curve, marker='D', label='Certified')
+            plt.axhline(clean_test, linestyle='--', color='black', label='Clean')
+            plt.xlabel('Poisoning fraction α')
+            plt.ylabel('Test MSE')
+            plt.title(fname)
+            plt.legend(frameon=False)
+            plt.tight_layout()
+            plt.show()
 
 
 if __name__ == "__main__":
